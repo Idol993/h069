@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "git-secret-scanner"
+version = "1.0.0"
+description = "Git repository sensitive information leak detection tool"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+git-secret-scanner = "scanner:main"
+
+[tool.setuptools.packages.find]
+include = ["*.py"]
