@@ -1,0 +1,95 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-06-22T01:29:13.300160",
+  "total_entries": 8,
+  "entries": [
+    {
+      "fingerprint": "763d96194ec302848d1bfd4ee665a434f30c83f4122490b904e06d29100b233d",
+      "rule_id": "aws-secret-access-key",
+      "file_path": "config.py",
+      "line_number": 1,
+      "secret_value_masked": "wJ************************************EY",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "bb2f0cec3f878d3f725c060da3608eb841f2b30b7364db7e54990ae6881b4668",
+      "rule_id": "aws-access-key-id",
+      "file_path": "config.py",
+      "line_number": 2,
+      "secret_value_masked": "AK****************LE",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "0da35bf02ad4126623021132b20e1957993ecb975f90d15fbaf4deac2c5547ed",
+      "rule_id": "database-connection-string",
+      "file_path": "config.py",
+      "line_number": 5,
+      "secret_value_masked": "po*****************************************************db",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "c602033af4041932498d01e2ccebc69f9490e9e21ff7f4cda4ff894cee7fbc3e",
+      "rule_id": "password-in-url",
+      "file_path": "config.py",
+      "line_number": 5,
+      "secret_value_masked": "my**************rd",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "a13c1e5d26f45fbc0ccc8f8721e30590076acdd1ea38b735c63d14743eb161d0",
+      "rule_id": "generic-api-key",
+      "file_path": "config.py",
+      "line_number": 7,
+      "secret_value_masked": "sk****************************************90",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "6d6319564f11e749bbe5b2a6b9258d993da1e2d48b594740dad3ab132d4c81b9",
+      "rule_id": "stripe-api-key",
+      "file_path": "config.py",
+      "line_number": 7,
+      "secret_value_masked": "sk****************************************90",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "2b396062612bd654af0a0e7155804d11aec388bc5bf4dba4bcb6d89e0afbc023",
+      "rule_id": "jwt-token",
+      "file_path": "config.py",
+      "line_number": 9,
+      "secret_value_masked": "ey*******************************************************************************************************************************************************5c",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    },
+    {
+      "fingerprint": "a20c83b4c36dbd9c42a7d7b7dfe9d3696aa421377fc4699e1594b7086d468c3b",
+      "rule_id": "github-token",
+      "file_path": "config.py",
+      "line_number": 11,
+      "secret_value_masked": "gh************************************90",
+      "first_seen_commit": "4258f921a911c4c440eae2767dff215234c7eea8",
+      "first_seen_author": "Test User",
+      "first_seen_date": "2026-06-22T00:56:33+08:00",
+      "status": "existing"
+    }
+  ]
+}

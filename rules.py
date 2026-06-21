@@ -1,5 +1,6 @@
 import re
 import os
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Optional, Pattern
 from dataclasses import dataclass, field
@@ -29,6 +30,46 @@ class RuleMatch:
     end: int
     line_number: int
     entropy: Optional[float] = None
+
+
+@dataclass
+class Allowlist:
+    paths: List[Pattern] = field(default_factory=list)
+    commits: List[str] = field(default_factory=list)
+    authors: List[str] = field(default_factory=list)
+    regexes: List[Pattern] = field(default_factory=list)
+    fingerprints: List[str] = field(default_factory=list)
+    rules: List[str] = field(default_factory=list)
+
+    def is_allowed(
+        self,
+        secret_value: str,
+        file_path: str,
+        commit_sha: str = "",
+        author: str = "",
+        rule_id: str = "",
+        line_content: str = "",
+    ) -> bool:
+        if not self.paths and not self.commits and not self.authors and not self.regexes and not self.fingerprints and not self.rules:
+            return False
+        if rule_id and rule_id in self.rules:
+            return True
+        if commit_sha and commit_sha in self.commits:
+            return True
+        if author and author in self.authors:
+            return True
+        fingerprint = hashlib.sha256(secret_value.encode()).hexdigest()
+        if fingerprint in self.fingerprints:
+            return True
+        if file_path:
+            for pattern in self.paths:
+                if pattern.search(file_path):
+                    return True
+        if line_content:
+            for pattern in self.regexes:
+                if pattern.search(line_content):
+                    return True
+        return False
 
 
 BUILTIN_RULES = [
@@ -184,12 +225,48 @@ def load_rules_from_yaml(filepath: str) -> List[Rule]:
     return rules
 
 
-def get_default_rule_paths() -> List[str]:
+def load_allowlist_from_yaml(filepath: str) -> Allowlist:
+    if yaml is None:
+        return Allowlist()
+    path = Path(filepath)
+    if not path.exists():
+        return Allowlist()
+    with open(path, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f) or {}
+    allowlist_data = data.get("allowlist", {})
+    if not allowlist_data:
+        return Allowlist()
+    paths = [re.compile(p) for p in allowlist_data.get("paths", [])]
+    commits = allowlist_data.get("commits", [])
+    authors = allowlist_data.get("authors", [])
+    regexes = [re.compile(r) for r in allowlist_data.get("regexes", [])]
+    fingerprints = allowlist_data.get("fingerprints", [])
+    rules = allowlist_data.get("rules", [])
+    return Allowlist(
+        paths=paths,
+        commits=commits,
+        authors=authors,
+        regexes=regexes,
+        fingerprints=fingerprints,
+        rules=rules,
+    )
+
+
+def get_default_rule_paths(repo_path: Optional[str] = None) -> List[str]:
     paths = []
+    if repo_path:
+        repo_config = Path(repo_path) / ".gitleaks.yaml"
+        if repo_config.exists():
+            paths.append(str(repo_config.resolve()))
     cwd = Path.cwd()
-    project_config = cwd / ".gitleaks.yaml"
-    if project_config.exists():
-        paths.append(str(project_config))
+    if repo_path:
+        cwd_config = cwd / ".gitleaks.yaml"
+        if cwd_config.exists() and str(cwd_config.resolve()) not in [str(Path(p).resolve()) for p in paths]:
+            paths.append(str(cwd_config.resolve()))
+    else:
+        project_config = cwd / ".gitleaks.yaml"
+        if project_config.exists():
+            paths.append(str(project_config))
     home = Path.home()
     user_config = home / ".gitleaks.yaml"
     if user_config.exists():
@@ -197,9 +274,9 @@ def get_default_rule_paths() -> List[str]:
     return paths
 
 
-def load_all_rules(custom_path: Optional[str] = None) -> List[Rule]:
+def load_all_rules(custom_path: Optional[str] = None, repo_path: Optional[str] = None) -> List[Rule]:
     rules = load_builtin_rules()
-    paths = get_default_rule_paths()
+    paths = get_default_rule_paths(repo_path)
     if custom_path:
         paths.insert(0, custom_path)
     for path in paths:
@@ -212,6 +289,25 @@ def load_all_rules(custom_path: Optional[str] = None) -> List[Rule]:
         except Exception:
             pass
     return rules
+
+
+def load_all_allowlists(custom_path: Optional[str] = None, repo_path: Optional[str] = None) -> Allowlist:
+    combined = Allowlist()
+    paths = get_default_rule_paths(repo_path)
+    if custom_path:
+        paths.insert(0, custom_path)
+    for path in paths:
+        try:
+            al = load_allowlist_from_yaml(path)
+            combined.paths.extend(al.paths)
+            combined.commits.extend(al.commits)
+            combined.authors.extend(al.authors)
+            combined.regexes.extend(al.regexes)
+            combined.fingerprints.extend(al.fingerprints)
+            combined.rules.extend(al.rules)
+        except Exception:
+            pass
+    return combined
 
 
 def match_rules(content: str, line_number: int, rules: List[Rule]) -> List[RuleMatch]:

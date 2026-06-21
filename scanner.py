@@ -12,10 +12,11 @@ except ImportError:
     click = None
 
 from entropy import calculate_entropy, extract_potential_secrets, is_high_entropy_string
-from rules import load_all_rules, match_rules, Rule, RuleMatch
+from rules import load_all_rules, load_all_allowlists, match_rules, Rule, RuleMatch, Allowlist
 from history_walker import HistoryWalker, DiffResult, DiffHunk, FileContext
-from reporter import Reporter, ScanFinding
+from reporter import Reporter, ScanFinding, ExitPolicy
 from remediator import Remediator
+from baseline import Baseline
 
 
 class GitSecretScanner:
@@ -30,6 +31,8 @@ class GitSecretScanner:
         max_commits: Optional[int] = None,
         since_commit: Optional[str] = None,
         enable_entropy_scan: bool = True,
+        baseline: Optional[Baseline] = None,
+        allowlist: Optional[Allowlist] = None,
     ):
         self.repo_path = Path(repo_path).resolve()
         self.entropy_threshold = entropy_threshold
@@ -39,13 +42,40 @@ class GitSecretScanner:
         self.since_commit = since_commit
         self.enable_entropy_scan = enable_entropy_scan
         self.walker = HistoryWalker(str(self.repo_path), max_commits)
-        self.rules = rules if rules else load_all_rules(custom_rules_path)
+        self.rules = rules if rules else load_all_rules(custom_rules_path, repo_path=str(self.repo_path))
+        self.allowlist = allowlist if allowlist is not None else load_all_allowlists(custom_rules_path, repo_path=str(self.repo_path))
+        self.baseline = baseline
         self.remediator = Remediator(str(self.repo_path))
         self._seen_secrets: Set[str] = set()
 
     def _get_secret_hash(self, secret: str, file_path: str, rule_id: str) -> str:
         data = f"{secret}|{file_path}|{rule_id}"
         return hashlib.sha256(data.encode()).hexdigest()
+
+    def _check_allowlist(
+        self,
+        secret_value: str,
+        file_path: str,
+        commit_sha: str,
+        author: str,
+        rule_id: str,
+        line_content: str,
+    ) -> Optional[str]:
+        if self.allowlist.is_allowed(
+            secret_value=secret_value,
+            file_path=file_path,
+            commit_sha=commit_sha,
+            author=author,
+            rule_id=rule_id,
+            line_content=line_content,
+        ):
+            return "allowlist"
+        return None
+
+    def _get_baseline_status(self, secret_value: str, file_path: str, rule_id: str) -> str:
+        if self.baseline is None:
+            return "new"
+        return self.baseline.get_status(secret_value, file_path, rule_id)
 
     def scan_line(
         self,
@@ -65,6 +95,16 @@ class GitSecretScanner:
             if secret_hash in self._seen_secrets:
                 continue
             self._seen_secrets.add(secret_hash)
+            ignore_reason = self._check_allowlist(
+                secret_value=rm.value,
+                file_path=file_path,
+                commit_sha=commit.sha,
+                author=commit.author_name,
+                rule_id=rm.rule.id,
+                line_content=line,
+            )
+            is_ignored = ignore_reason is not None
+            status = self._get_baseline_status(rm.value, file_path, rm.rule.id)
             file_ctx = self.walker.get_file_context(
                 file_path, line_number, commit.sha, self.context_lines
             )
@@ -95,6 +135,9 @@ class GitSecretScanner:
                 entropy=entropy,
                 tags=rm.rule.tags,
                 revert_suggestion=revert_suggestion,
+                status=status,
+                ignored=is_ignored,
+                ignore_reason=ignore_reason or "",
             ))
         if self.enable_entropy_scan:
             entropy_matches = extract_potential_secrets(
@@ -111,6 +154,16 @@ class GitSecretScanner:
                 if secret_hash in self._seen_secrets:
                     continue
                 self._seen_secrets.add(secret_hash)
+                ignore_reason = self._check_allowlist(
+                    secret_value=em.value,
+                    file_path=file_path,
+                    commit_sha=commit.sha,
+                    author=commit.author_name,
+                    rule_id="high-entropy",
+                    line_content=line,
+                )
+                is_ignored = ignore_reason is not None
+                status = self._get_baseline_status(em.value, file_path, "high-entropy")
                 file_ctx = self.walker.get_file_context(
                     file_path, line_number, commit.sha, self.context_lines
                 )
@@ -141,6 +194,9 @@ class GitSecretScanner:
                     entropy=em.entropy,
                     tags=["entropy"],
                     revert_suggestion=revert_suggestion,
+                    status=status,
+                    ignored=is_ignored,
+                    ignore_reason=ignore_reason or "",
                 ))
         return findings
 
@@ -217,8 +273,16 @@ if click is not None:
                   help='Start scanning from this commit SHA')
     @click.option('--no-entropy', is_flag=True, default=False,
                   help='Disable high-entropy string scanning')
+    @click.option('--baseline', '-b', 'baseline_path', type=click.Path(dir_okay=False),
+                  help='Path to baseline file for comparing results')
+    @click.option('--fail-on-severity', 'fail_on_severity', type=str, default=None,
+                  help='Comma-separated list of severities to fail on (e.g. critical,high)')
+    @click.option('--fail-on-new-only', is_flag=True, default=False,
+                  help='Only fail on new findings (not existing in baseline)')
+    @click.option('--fail-on-tags', 'fail_on_tags', type=str, default=None,
+                  help='Comma-separated list of tags to fail on')
     @click.option('--exit-code', is_flag=True, default=False,
-                  help='Exit with non-zero code if secrets are found')
+                  help='Exit with non-zero code if blocking secrets are found')
     def scan(
         repo_path,
         rules_path,
@@ -230,9 +294,21 @@ if click is not None:
         max_commits,
         since_commit,
         no_entropy,
+        baseline_path,
+        fail_on_severity,
+        fail_on_new_only,
+        fail_on_tags,
         exit_code,
     ):
         try:
+            baseline = Baseline(baseline_path) if baseline_path else None
+            exit_policy = ExitPolicy()
+            if fail_on_severity:
+                exit_policy.fail_on_severity = [s.strip() for s in fail_on_severity.split(',')]
+            if fail_on_new_only:
+                exit_policy.fail_on_new_only = True
+            if fail_on_tags:
+                exit_policy.fail_on_tags = [t.strip() for t in fail_on_tags.split(',')]
             scanner = GitSecretScanner(
                 repo_path=repo_path,
                 custom_rules_path=rules_path,
@@ -242,17 +318,131 @@ if click is not None:
                 max_commits=max_commits,
                 since_commit=since_commit,
                 enable_entropy_scan=not no_entropy,
+                baseline=baseline,
             )
-            reporter = Reporter(output_format=output_format, output_file=output_file)
+            reporter = Reporter(
+                output_format=output_format,
+                output_file=output_file,
+                repo_path=str(scanner.repo_path),
+                exit_policy=exit_policy,
+            )
             with click.progressbar(label='Scanning commits', length=0) as bar:
                 def progress(count):
                     bar.length = count
                     bar.update(1)
                 reporter = scanner.scan_repository(reporter, progress_callback=progress)
             reporter.render()
-            if exit_code and len(reporter.findings) > 0:
+            if exit_code and exit_policy.should_fail(reporter.findings):
                 sys.exit(1)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+    @cli.group()
+    def baseline():
+        pass
+
+    @baseline.command('create')
+    @click.argument('repo_path', default='.')
+    @click.option('--output', '-o', 'output_file', type=click.Path(dir_okay=False, writable=True),
+                  default='.git-secret-baseline.json', help='Output baseline file path')
+    @click.option('--rules', '-r', 'rules_path', type=click.Path(exists=True, dir_okay=False),
+                  help='Path to custom rules YAML file')
+    @click.option('--no-entropy', is_flag=True, default=False,
+                  help='Disable high-entropy string scanning')
+    @click.option('--max-commits', type=int, default=None,
+                  help='Maximum number of commits to scan')
+    def baseline_create(repo_path, output_file, rules_path, no_entropy, max_commits):
+        try:
+            scanner = GitSecretScanner(
+                repo_path=repo_path,
+                custom_rules_path=rules_path,
+                enable_entropy_scan=not no_entropy,
+                max_commits=max_commits,
+            )
+            baseline_obj = Baseline()
+            reporter = Reporter(repo_path=str(scanner.repo_path))
+            with click.progressbar(label='Scanning for baseline', length=0) as bar:
+                def progress(count):
+                    bar.length = count
+                    bar.update(1)
+                reporter = scanner.scan_repository(reporter, progress_callback=progress)
+            for finding in reporter.findings:
+                if finding.ignored:
+                    continue
+                baseline_obj.add_entry(
+                    secret_value=finding.secret_value,
+                    file_path=finding.file_path,
+                    rule_id=finding.rule_id,
+                    line_number=finding.line_number,
+                    masked_value=finding.masked_value,
+                    commit_sha=finding.commit_sha,
+                    author=finding.author_name,
+                    date=finding.commit_date,
+                )
+            baseline_obj.save(output_file)
+            click.echo(f"Baseline created with {len(baseline_obj.entries)} entries at {output_file}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
+    @baseline.command('update')
+    @click.argument('repo_path', default='.')
+    @click.option('--baseline', '-b', 'baseline_path', type=click.Path(dir_okay=False, exists=True),
+                  default='.git-secret-baseline.json', help='Baseline file to update')
+    @click.option('--rules', '-r', 'rules_path', type=click.Path(exists=True, dir_okay=False),
+                  help='Path to custom rules YAML file')
+    @click.option('--no-entropy', is_flag=True, default=False,
+                  help='Disable high-entropy string scanning')
+    def baseline_update(repo_path, baseline_path, rules_path, no_entropy):
+        try:
+            baseline_obj = Baseline(baseline_path)
+            scanner = GitSecretScanner(
+                repo_path=repo_path,
+                custom_rules_path=rules_path,
+                enable_entropy_scan=not no_entropy,
+                baseline=baseline_obj,
+            )
+            reporter = Reporter(repo_path=str(scanner.repo_path))
+            with click.progressbar(label='Scanning to update baseline', length=0) as bar:
+                def progress(count):
+                    bar.length = count
+                    bar.update(1)
+                reporter = scanner.scan_repository(reporter, progress_callback=progress)
+            current_fps = set()
+            added = 0
+            for finding in reporter.findings:
+                if finding.ignored:
+                    continue
+                fp = Baseline.compute_fingerprint(finding.secret_value, finding.file_path, finding.rule_id)
+                current_fps.add(fp)
+                if fp not in baseline_obj.entries:
+                    baseline_obj.add_entry(
+                        secret_value=finding.secret_value,
+                        file_path=finding.file_path,
+                        rule_id=finding.rule_id,
+                        line_number=finding.line_number,
+                        masked_value=finding.masked_value,
+                        commit_sha=finding.commit_sha,
+                        author=finding.author_name,
+                        date=finding.commit_date,
+                    )
+                    added += 1
+            removed = 0
+            to_remove = [fp for fp in baseline_obj.entries if fp not in current_fps]
+            for fp in to_remove:
+                del baseline_obj.entries[fp]
+                removed += 1
+            baseline_obj.save()
+            click.echo(f"Baseline updated: {len(baseline_obj.entries)} entries "
+                       f"(added: {added}, removed: {removed})")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             click.echo(f"Error: {e}", err=True)
             sys.exit(1)
 
@@ -277,6 +467,34 @@ rules:
     regex: 'company-db://[^\\s]+'
     severity: critical
     tags: [database, company]
+
+# Allowlist - secrets matching these will be ignored in failure exit code
+# They will still appear in reports with "ignored" status for audit
+allowlist:
+  # Path patterns to ignore (regex matched against file path)
+  paths:
+    - 'test_.*\\.py$'
+    - '\\.example$'
+    - 'fixtures/'
+
+  # Specific commit SHAs to ignore entirely
+  commits: []
+
+  # Author names or emails to ignore
+  authors: []
+
+  # Regex patterns to match against the line content
+  regexes:
+    - 'example.*key'
+    - 'dummy.*password'
+    - 'TEST_.*SECRET'
+
+  # Specific secret fingerprints (SHA256 of the secret value)
+  # Use: echo -n "secret_value" | sha256sum
+  fingerprints: []
+
+  # Specific rule IDs to completely ignore
+  rules: []
 """
         path = Path(config_path)
         if path.exists():
