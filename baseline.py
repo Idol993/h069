@@ -31,6 +31,7 @@ class Baseline:
     def __init__(self, baseline_path: Optional[str] = None):
         self.baseline_path = Path(baseline_path) if baseline_path else None
         self.entries: Dict[str, BaselineEntry] = {}
+        self.trend_history: List[Dict] = []
         if self.baseline_path and self.baseline_path.exists():
             self.load()
 
@@ -48,6 +49,7 @@ class Baseline:
         for entry_data in entries_data:
             entry = BaselineEntry(**entry_data)
             self.entries[entry.fingerprint] = entry
+        self.trend_history = data.get("trend_history", [])
 
     def save(self, output_path: Optional[str] = None):
         path = Path(output_path) if output_path else self.baseline_path
@@ -58,6 +60,7 @@ class Baseline:
             "generated_at": datetime.now().isoformat(),
             "total_entries": len(self.entries),
             "entries": [entry.to_dict() for entry in self.entries.values()],
+            "trend_history": self.trend_history,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
@@ -177,3 +180,48 @@ class Baseline:
                 author=finding.author_name,
                 date=finding.commit_date,
             )
+
+    def record_trend_snapshot(self, reporter_findings: list, reporter_ignored: list, reporter_resolved: list) -> Dict:
+        def _count_sev(items, key):
+            return sum(1 for f in items if getattr(f, 'severity', '').lower() == key)
+        existing_count = sum(1 for e in self.entries.values() if e.status == "existing")
+        resolved_count = sum(1 for e in self.entries.values() if e.status == "resolved")
+        snapshot = {
+            "date": datetime.now().isoformat(),
+            "new": sum(1 for f in reporter_findings if f.status == "new"),
+            "existing": existing_count,
+            "resolved": resolved_count,
+            "ignored": len(reporter_ignored),
+            "by_severity": {
+                "critical": _count_sev(reporter_findings, "critical"),
+                "high": _count_sev(reporter_findings, "high"),
+                "medium": _count_sev(reporter_findings, "medium"),
+                "low": _count_sev(reporter_findings, "low"),
+            },
+        }
+        prev = self.trend_history[-1] if self.trend_history else None
+        if prev:
+            delta = {}
+            for key in ["new", "existing", "resolved", "ignored"]:
+                curr_val = snapshot.get(key, 0)
+                prev_val = prev.get(key, 0)
+                diff = curr_val - prev_val
+                if diff > 0:
+                    delta[key] = f"+{diff}"
+                elif diff < 0:
+                    delta[key] = str(diff)
+                else:
+                    delta[key] = "0"
+            for sev in ["critical", "high", "medium", "low"]:
+                curr_val = snapshot.get("by_severity", {}).get(sev, 0)
+                prev_val = prev.get("by_severity", {}).get(sev, 0)
+                diff = curr_val - prev_val
+                if diff > 0:
+                    delta[f"severity_{sev}"] = f"+{diff}"
+                elif diff < 0:
+                    delta[f"severity_{sev}"] = str(diff)
+                else:
+                    delta[f"severity_{sev}"] = "0"
+            snapshot["delta"] = delta
+        self.trend_history.append(snapshot)
+        return snapshot

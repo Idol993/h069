@@ -146,6 +146,11 @@ class Reporter:
         self._console = Console() if RICH_AVAILABLE else None
         self._known_secrets: Set[str] = set()
         self._sorted_secrets: Optional[List[str]] = None
+        self.active_rules_count: int = 0
+        self.total_rules_loaded: int = 0
+        self.enable_tags: Optional[List[str]] = None
+        self.disable_tags: Optional[List[str]] = None
+        self.trend_snapshot: Optional[Dict[str, Any]] = None
 
     def _collect_known_secrets(self):
         if self._sorted_secrets is not None:
@@ -418,6 +423,17 @@ class Reporter:
             Text(str(total_active["total"]), style="bold"),
         )
         console.print(summary_table)
+        if self.total_rules_loaded > 0:
+            console.print()
+            rules_text = f"Rules: {self.active_rules_count}/{self.total_rules_loaded} active"
+            if self.enable_tags:
+                rules_text += f" (enabled: {','.join(self.enable_tags)})"
+            if self.disable_tags:
+                rules_text += f" (disabled: {','.join(self.disable_tags)})"
+            console.print(f"[dim]{rules_text}[/dim]")
+        if self.trend_snapshot:
+            console.print()
+            self._render_trend_rich(console)
         if self.exit_policy.is_active():
             policy_desc = self.exit_policy.get_description()
             console.print()
@@ -478,11 +494,111 @@ class Reporter:
         new_count = sum(1 for f in self.findings if f.status == "new")
         existing_count = sum(1 for f in self.findings if f.status == "existing")
         print(f"\nSummary: {len(self.findings)} active (new: {new_count}, existing: {existing_count}), {len(self.ignored_findings)} ignored, {len(self.resolved_findings)} resolved")
+        if self.total_rules_loaded > 0:
+            rules_text = f"Rules: {self.active_rules_count}/{self.total_rules_loaded} active"
+            if self.enable_tags:
+                rules_text += f" (enabled: {','.join(self.enable_tags)})"
+            if self.disable_tags:
+                rules_text += f" (disabled: {','.join(self.disable_tags)})"
+            print(rules_text)
+        if self.trend_snapshot:
+            self._render_trend_plain()
         if self.exit_policy.is_active():
             print(f"Exit Policy: {self.exit_policy.get_description()}")
         blocking = self.exit_policy.get_blocking_findings(self.findings)
         if blocking:
             print(f"Blocking findings: {len(blocking)} (would fail CI)")
+
+    def _render_trend_rich(self, console):
+        if not self.trend_snapshot:
+            return
+        snap = self.trend_snapshot
+        delta = snap.get("delta", {})
+        trend_table = Table(title="Trend vs Last Scan", show_header=True, border_style="dim")
+        trend_table.add_column("Category", style="bold")
+        trend_table.add_column("Current", justify="right")
+        trend_table.add_column("Delta", justify="right")
+        for key, label in [("new", "New"), ("existing", "Existing"), ("resolved", "Resolved"), ("ignored", "Ignored")]:
+            d = delta.get(key, "—")
+            color = "red" if d.startswith("+") else "green" if d.startswith("-") and d != "0" else "dim"
+            trend_table.add_row(label, str(snap.get(key, 0)), Text(d, style=color))
+        console.print(trend_table)
+
+    def _render_trend_plain(self):
+        if not self.trend_snapshot:
+            return
+        snap = self.trend_snapshot
+        delta = snap.get("delta", {})
+        print("Trend vs Last Scan:")
+        for key, label in [("new", "New"), ("existing", "Existing"), ("resolved", "Resolved"), ("ignored", "Ignored")]:
+            d = delta.get(key, "—")
+            print(f"  {label}: {snap.get(key, 0)} ({d})")
+
+    def render_mr_comment(self) -> str:
+        from collections import OrderedDict
+        grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = OrderedDict()
+        active_findings = [f for f in self.findings if not f.ignored]
+        for finding in active_findings:
+            file_key = finding.file_path
+            if finding.hunk_file:
+                hunk_key = f"L{finding.hunk_new_start}-{finding.hunk_new_end}"
+            else:
+                hunk_key = f"L{finding.line_number}"
+            if file_key not in grouped:
+                grouped[file_key] = OrderedDict()
+            if hunk_key not in grouped[file_key]:
+                grouped[file_key][hunk_key] = []
+            grouped[file_key][hunk_key].append({
+                "rule": finding.rule_id,
+                "severity": finding.severity,
+                "status": finding.status,
+                "commit": finding.short_sha,
+                "message": f"[{finding.severity.upper()}] {finding.rule_description} — {finding.masked_value}",
+            })
+        annotations = []
+        for file_path, hunks in grouped.items():
+            file_item: Dict[str, Any] = {
+                "file": file_path,
+                "hunks": [],
+            }
+            for hunk_key, findings_list in hunks.items():
+                hunk_item: Dict[str, Any] = {
+                    "location": hunk_key,
+                    "findings": findings_list,
+                }
+                if findings_list:
+                    first_f = next(
+                        (f for f in self.findings if f.file_path == file_path and f.hunk_file),
+                        None,
+                    )
+                    if first_f and first_f.hunk_file:
+                        hunk_item["new_range"] = f"{first_f.hunk_new_start}-{first_f.hunk_new_end}"
+                        hunk_item["old_range"] = f"{first_f.hunk_old_start}-{first_f.hunk_old_end}"
+                file_item["hunks"].append(hunk_item)
+            annotations.append(file_item)
+        def _count_sev(findings_list, key):
+            return sum(1 for f in findings_list if getattr(f, 'severity', '').lower() == key)
+        summary_data = {
+            "total_active": len(self.findings),
+            "new": sum(1 for f in self.findings if f.status == "new"),
+            "existing": sum(1 for f in self.findings if f.status == "existing"),
+            "ignored": len(self.ignored_findings),
+            "resolved": len(self.resolved_findings),
+            "blocking": len(self.exit_policy.get_blocking_findings(self.findings)),
+            "by_severity": {
+                "critical": _count_sev(self.findings, "critical"),
+                "high": _count_sev(self.findings, "high"),
+                "medium": _count_sev(self.findings, "medium"),
+                "low": _count_sev(self.findings, "low"),
+            },
+        }
+        output = {
+            "version": "1.0",
+            "type": "mr-comment",
+            "summary": summary_data,
+            "annotations": annotations,
+        }
+        return json.dumps(output, indent=2, ensure_ascii=False)
 
     def render_json(self) -> str:
         findings_data = []
@@ -546,6 +662,15 @@ class Reporter:
             "summary": summary,
             "findings": findings_data,
         }
+        if self.active_rules_count > 0:
+            output["rules_info"] = {
+                "active": self.active_rules_count,
+                "total": self.total_rules_loaded,
+                "enable_tags": self.enable_tags,
+                "disable_tags": self.disable_tags,
+            }
+        if self.trend_snapshot:
+            output["trend"] = self.trend_snapshot
         return json.dumps(output, indent=2, ensure_ascii=False)
 
     def render_sarif(self) -> str:
@@ -692,6 +817,8 @@ class Reporter:
             output = self.render_json()
         elif self.output_format == "sarif":
             output = self.render_sarif()
+        elif self.output_format == "mr-comment":
+            output = self.render_mr_comment()
         elif self.output_format == "terminal":
             self.render_terminal()
             return None

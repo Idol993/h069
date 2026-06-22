@@ -33,6 +33,8 @@ class GitSecretScanner:
         enable_entropy_scan: bool = True,
         baseline: Optional[Baseline] = None,
         allowlist: Optional[Allowlist] = None,
+        enable_tags: Optional[List[str]] = None,
+        disable_tags: Optional[List[str]] = None,
     ):
         self.repo_path = Path(repo_path).resolve()
         self.entropy_threshold = entropy_threshold
@@ -42,11 +44,38 @@ class GitSecretScanner:
         self.since_commit = since_commit
         self.enable_entropy_scan = enable_entropy_scan
         self.walker = HistoryWalker(str(self.repo_path), max_commits)
-        self.rules = rules if rules else load_all_rules(custom_rules_path, repo_path=str(self.repo_path))
+        all_rules = rules if rules else load_all_rules(custom_rules_path, repo_path=str(self.repo_path))
+        self.total_rules_loaded = len(all_rules)
+        self.rules = self._filter_rules_by_tags(all_rules, enable_tags, disable_tags)
+        self.active_rules_count = len(self.rules)
+        self.enable_tags = enable_tags
+        self.disable_tags = disable_tags
         self.allowlist = allowlist if allowlist is not None else load_all_allowlists(custom_rules_path, repo_path=str(self.repo_path))
         self.baseline = baseline
         self.remediator = Remediator(str(self.repo_path))
         self._seen_secrets: Set[str] = set()
+
+    @staticmethod
+    def _filter_rules_by_tags(
+        rules: List[Rule],
+        enable_tags: Optional[List[str]] = None,
+        disable_tags: Optional[List[str]] = None,
+    ) -> List[Rule]:
+        if not enable_tags and not disable_tags:
+            return rules
+        filtered = []
+        enable_set = {t.lower() for t in enable_tags} if enable_tags else None
+        disable_set = {t.lower() for t in disable_tags} if disable_tags else None
+        for rule in rules:
+            rule_tags_lower = {t.lower() for t in rule.tags}
+            if enable_set is not None:
+                if not rule_tags_lower.intersection(enable_set):
+                    continue
+            if disable_set is not None:
+                if rule_tags_lower.intersection(disable_set):
+                    continue
+            filtered.append(rule)
+        return filtered
 
     def _get_secret_hash(self, secret: str, file_path: str, rule_id: str) -> str:
         data = f"{secret}|{file_path}|{rule_id}"
@@ -288,6 +317,10 @@ class GitSecretScanner:
             resolved_entries = self.baseline.get_resolved_entries()
             for entry in resolved_entries:
                 reporter.add_resolved_from_baseline(entry)
+            snapshot = self.baseline.record_trend_snapshot(
+                reporter.findings, reporter.ignored_findings, reporter.resolved_findings
+            )
+            reporter.trend_snapshot = snapshot
         elapsed = time.time() - start_time
         return reporter
 
@@ -330,6 +363,10 @@ class GitSecretScanner:
             resolved_entries = self.baseline.get_resolved_entries()
             for entry in resolved_entries:
                 reporter.add_resolved_from_baseline(entry)
+            snapshot = self.baseline.record_trend_snapshot(
+                reporter.findings, reporter.ignored_findings, reporter.resolved_findings
+            )
+            reporter.trend_snapshot = snapshot
         elapsed = time.time() - start_time
         return reporter
 
@@ -344,7 +381,7 @@ if click is not None:
     @click.argument('repo_path', default='.')
     @click.option('--rules', '-r', 'rules_path', type=click.Path(exists=True, dir_okay=False),
                   help='Path to custom rules YAML file')
-    @click.option('--format', '-f', 'output_format', type=click.Choice(['terminal', 'json', 'sarif']),
+    @click.option('--format', '-f', 'output_format', type=click.Choice(['terminal', 'json', 'sarif', 'mr-comment']),
                   default='terminal', help='Output format')
     @click.option('--output', '-o', 'output_file', type=click.Path(dir_okay=False, writable=True),
                   help='Output file path')
@@ -370,6 +407,10 @@ if click is not None:
                   help='Comma-separated list of tags to fail on')
     @click.option('--exit-code', is_flag=True, default=False,
                   help='Exit with non-zero code if blocking secrets are found')
+    @click.option('--enable-tags', 'enable_tags', type=str, default=None,
+                  help='Only enable rules matching these tags (comma-separated, e.g. aws,database)')
+    @click.option('--disable-tags', 'disable_tags', type=str, default=None,
+                  help='Disable rules matching these tags (comma-separated, e.g. test,example)')
     def scan(
         repo_path,
         rules_path,
@@ -386,6 +427,8 @@ if click is not None:
         fail_on_new_only,
         fail_on_tags,
         exit_code,
+        enable_tags,
+        disable_tags,
     ):
         try:
             baseline = Baseline(baseline_path) if baseline_path else None
@@ -406,6 +449,8 @@ if click is not None:
                 since_commit=since_commit,
                 enable_entropy_scan=not no_entropy,
                 baseline=baseline,
+                enable_tags=[t.strip().lower() for t in enable_tags.split(',')] if enable_tags else None,
+                disable_tags=[t.strip().lower() for t in disable_tags.split(',')] if disable_tags else None,
             )
             reporter = Reporter(
                 output_format=output_format,
@@ -413,6 +458,10 @@ if click is not None:
                 repo_path=str(scanner.repo_path),
                 exit_policy=exit_policy,
             )
+            reporter.active_rules_count = scanner.active_rules_count
+            reporter.total_rules_loaded = scanner.total_rules_loaded
+            reporter.enable_tags = scanner.enable_tags
+            reporter.disable_tags = scanner.disable_tags
             with click.progressbar(label='Scanning commits', length=0) as bar:
                 def progress(count):
                     bar.length = count
@@ -433,7 +482,7 @@ if click is not None:
     @click.argument('repo_path', default='.')
     @click.option('--rules', '-r', 'rules_path', type=click.Path(exists=True, dir_okay=False),
                   help='Path to custom rules YAML file')
-    @click.option('--format', '-f', 'output_format', type=click.Choice(['terminal', 'json', 'sarif']),
+    @click.option('--format', '-f', 'output_format', type=click.Choice(['terminal', 'json', 'sarif', 'mr-comment']),
                   default='terminal', help='Output format')
     @click.option('--output', '-o', 'output_file', type=click.Path(dir_okay=False, writable=True),
                   help='Output file path')
@@ -455,6 +504,10 @@ if click is not None:
                   help='Comma-separated list of tags to fail on')
     @click.option('--exit-code', is_flag=True, default=False,
                   help='Exit with non-zero code if blocking secrets are found')
+    @click.option('--enable-tags', 'enable_tags', type=str, default=None,
+                  help='Only enable rules matching these tags (comma-separated, e.g. aws,database)')
+    @click.option('--disable-tags', 'disable_tags', type=str, default=None,
+                  help='Disable rules matching these tags (comma-separated, e.g. test,example)')
     def scan_diff(
         base_ref,
         head_ref,
@@ -471,6 +524,8 @@ if click is not None:
         fail_on_new_only,
         fail_on_tags,
         exit_code,
+        enable_tags,
+        disable_tags,
     ):
         try:
             baseline = Baseline(baseline_path) if baseline_path else None
@@ -489,6 +544,8 @@ if click is not None:
                 context_lines=context_lines,
                 enable_entropy_scan=not no_entropy,
                 baseline=baseline,
+                enable_tags=[t.strip().lower() for t in enable_tags.split(',')] if enable_tags else None,
+                disable_tags=[t.strip().lower() for t in disable_tags.split(',')] if disable_tags else None,
             )
             reporter = Reporter(
                 output_format=output_format,
@@ -496,6 +553,10 @@ if click is not None:
                 repo_path=str(scanner.repo_path),
                 exit_policy=exit_policy,
             )
+            reporter.active_rules_count = scanner.active_rules_count
+            reporter.total_rules_loaded = scanner.total_rules_loaded
+            reporter.enable_tags = scanner.enable_tags
+            reporter.disable_tags = scanner.disable_tags
             with click.progressbar(label=f'Scanning {base_ref}..{head_ref}', length=0) as bar:
                 def progress(count):
                     bar.length = count
