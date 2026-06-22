@@ -52,6 +52,11 @@ class ScanFinding:
     status: str = "new"
     ignored: bool = False
     ignore_reason: str = ""
+    hunk_file: str = ""
+    hunk_new_start: int = 0
+    hunk_new_end: int = 0
+    hunk_old_start: int = 0
+    hunk_old_end: int = 0
 
 
 @dataclass
@@ -77,6 +82,14 @@ class ExitPolicy:
         if not self.fail_on_severity or len(self.fail_on_severity) != 1:
             return False
         return self.fail_on_severity[0].lower() in self.SEVERITY_ORDER
+
+    def is_active(self) -> bool:
+        return bool(
+            self.fail_on_severity
+            or self.fail_on_status
+            or self.fail_on_tags
+            or self.fail_on_new_only
+        )
 
     def get_description(self) -> str:
         parts = []
@@ -405,6 +418,10 @@ class Reporter:
             Text(str(total_active["total"]), style="bold"),
         )
         console.print(summary_table)
+        if self.exit_policy.is_active():
+            policy_desc = self.exit_policy.get_description()
+            console.print()
+            console.print(f"[dim]Exit Policy:[/dim] [bold]{policy_desc}[/bold]")
         blocking = self.exit_policy.get_blocking_findings(self.findings)
         if blocking:
             console.print()
@@ -461,6 +478,8 @@ class Reporter:
         new_count = sum(1 for f in self.findings if f.status == "new")
         existing_count = sum(1 for f in self.findings if f.status == "existing")
         print(f"\nSummary: {len(self.findings)} active (new: {new_count}, existing: {existing_count}), {len(self.ignored_findings)} ignored, {len(self.resolved_findings)} resolved")
+        if self.exit_policy.is_active():
+            print(f"Exit Policy: {self.exit_policy.get_description()}")
         blocking = self.exit_policy.get_blocking_findings(self.findings)
         if blocking:
             print(f"Blocking findings: {len(blocking)} (would fail CI)")
@@ -497,6 +516,14 @@ class Reporter:
                 "entropy": finding.entropy,
                 "tags": finding.tags,
             }
+            if finding.hunk_file:
+                data["hunk"] = {
+                    "file": finding.hunk_file,
+                    "new_start": finding.hunk_new_start,
+                    "new_end": finding.hunk_new_end,
+                    "old_start": finding.hunk_old_start,
+                    "old_end": finding.hunk_old_end,
+                }
             if finding.revert_suggestion:
                 data["revert_command"] = finding.revert_suggestion.revert_command
             findings_data.append(data)
@@ -594,6 +621,9 @@ class Reporter:
                     "kind": "external",
                     "justification": "resolved - secret no longer present in codebase",
                 })
+            hunk_info_text = ""
+            if finding.hunk_file:
+                hunk_info_text = f" Hunk: lines {finding.hunk_new_start}-{finding.hunk_new_end} (new) / {finding.hunk_old_start}-{finding.hunk_old_end} (old)."
             result = {
                 "ruleId": finding.rule_id,
                 "level": level,
@@ -602,6 +632,7 @@ class Reporter:
                     "text": f"[{finding.status.upper()}] {finding.rule_description} in {finding.file_path}:{finding.line_number}. "
                             f"Secret: {finding.masked_value}. "
                             f"Commit: {finding.short_sha} by {finding.author_name}."
+                            + hunk_info_text
                             + (f" Line: {masked_line}" if masked_line else "")
                 },
                 "locations": [
@@ -635,6 +666,16 @@ class Reporter:
                     "tags": finding.tags,
                 },
             }
+            if finding.hunk_file:
+                result["properties"]["hunk"] = {
+                    "file": finding.hunk_file,
+                    "new_start": finding.hunk_new_start,
+                    "new_end": finding.hunk_new_end,
+                    "old_start": finding.hunk_old_start,
+                    "old_end": finding.hunk_old_end,
+                }
+                result["locations"][0]["physicalLocation"]["region"]["startLine"] = finding.hunk_new_start
+                result["locations"][0]["physicalLocation"]["region"]["endLine"] = finding.hunk_new_end
             if finding.line_content:
                 result["locations"][0]["physicalLocation"]["region"]["snippet"] = {
                     "text": masked_line,

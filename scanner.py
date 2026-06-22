@@ -83,6 +83,7 @@ class GitSecretScanner:
         line_number: int,
         file_path: str,
         commit: 'CommitInfo',
+        hunk_info: Optional['DiffHunk'] = None,
     ) -> List[ScanFinding]:
         findings = []
         rule_matches = match_rules(line, line_number, self.rules)
@@ -112,7 +113,7 @@ class GitSecretScanner:
             revert_suggestion = self.remediator.generate_revert_suggestion(
                 commit, rm.value, rm.rule.id
             )
-            findings.append(ScanFinding(
+            finding_kwargs = dict(
                 rule_id=rm.rule.id,
                 rule_description=rm.rule.description,
                 severity=rm.rule.severity,
@@ -138,7 +139,16 @@ class GitSecretScanner:
                 status=status,
                 ignored=is_ignored,
                 ignore_reason=ignore_reason or "",
-            ))
+            )
+            if hunk_info:
+                finding_kwargs.update(dict(
+                    hunk_file=hunk_info.file_path,
+                    hunk_new_start=hunk_info.new_line_start,
+                    hunk_new_end=hunk_info.new_line_end,
+                    hunk_old_start=hunk_info.old_line_start,
+                    hunk_old_end=hunk_info.old_line_end,
+                ))
+            findings.append(ScanFinding(**finding_kwargs))
         if self.enable_entropy_scan:
             entropy_matches = extract_potential_secrets(
                 line, self.entropy_threshold, self.min_entropy_length
@@ -171,7 +181,7 @@ class GitSecretScanner:
                 revert_suggestion = self.remediator.generate_revert_suggestion(
                     commit, em.value, "high-entropy"
                 )
-                findings.append(ScanFinding(
+                entropy_finding_kwargs = dict(
                     rule_id="high-entropy",
                     rule_description=f"High entropy string (entropy: {em.entropy:.2f})",
                     severity="medium",
@@ -197,7 +207,16 @@ class GitSecretScanner:
                     status=status,
                     ignored=is_ignored,
                     ignore_reason=ignore_reason or "",
-                ))
+                )
+                if hunk_info:
+                    entropy_finding_kwargs.update(dict(
+                        hunk_file=hunk_info.file_path,
+                        hunk_new_start=hunk_info.new_line_start,
+                        hunk_new_end=hunk_info.new_line_end,
+                        hunk_old_start=hunk_info.old_line_start,
+                        hunk_old_end=hunk_info.old_line_end,
+                    ))
+                findings.append(ScanFinding(**entropy_finding_kwargs))
         return findings
 
     def _mask_secret(self, secret: str, show_first: int = 2, show_last: int = 2) -> str:
@@ -209,22 +228,27 @@ class GitSecretScanner:
         self,
         hunk: DiffHunk,
         commit: 'CommitInfo',
+        diff_mode: bool = False,
     ) -> List[ScanFinding]:
         findings = []
         for i, line in enumerate(hunk.new_lines):
+            if diff_mode:
+                if i < len(hunk.new_line_types) and hunk.new_line_types[i] != "added":
+                    continue
             line_num = hunk.new_line_start + i
             if line_num < 1:
                 continue
-            findings.extend(self.scan_line(line, line_num, hunk.file_path, commit))
+            findings.extend(self.scan_line(line, line_num, hunk.file_path, commit, hunk_info=hunk))
         return findings
 
     def scan_commit(
         self,
         diff_result: DiffResult,
+        diff_mode: bool = False,
     ) -> List[ScanFinding]:
         findings = []
         for hunk in diff_result.hunks:
-            findings.extend(self.scan_hunk(hunk, diff_result.commit))
+            findings.extend(self.scan_hunk(hunk, diff_result.commit, diff_mode=diff_mode))
         return findings
 
     def scan_repository(
@@ -260,10 +284,8 @@ class GitSecretScanner:
                         finding.secret_value, finding.file_path, finding.rule_id
                     )
                     current_fps.add(fp)
+            self.baseline.mark_resolved(current_fps)
             resolved_entries = self.baseline.get_resolved_entries()
-            if not resolved_entries:
-                self.baseline.mark_resolved(current_fps)
-                resolved_entries = self.baseline.get_resolved_entries()
             for entry in resolved_entries:
                 reporter.add_resolved_from_baseline(entry)
         elapsed = time.time() - start_time
@@ -284,7 +306,7 @@ class GitSecretScanner:
             total_commits += 1
             if progress_callback:
                 progress_callback(total_commits)
-            findings = self.scan_commit(diff_result)
+            findings = self.scan_commit(diff_result, diff_mode=True)
             for finding in findings:
                 reporter.add_finding(finding)
                 if self.baseline is not None and not finding.ignored:
@@ -304,6 +326,7 @@ class GitSecretScanner:
                         finding.secret_value, finding.file_path, finding.rule_id
                     )
                     current_fps.add(fp)
+            self.baseline.mark_resolved(current_fps)
             resolved_entries = self.baseline.get_resolved_entries()
             for entry in resolved_entries:
                 reporter.add_resolved_from_baseline(entry)

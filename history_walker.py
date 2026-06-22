@@ -27,6 +27,9 @@ class DiffHunk:
     old_lines: List[str]
     new_lines: List[str]
     is_binary: bool = False
+    new_line_types: List[str] = field(default_factory=list)
+    old_line_end: int = 0
+    new_line_end: int = 0
 
 
 @dataclass
@@ -134,42 +137,47 @@ class HistoryWalker:
         if not output.strip():
             return hunks
         current_file = None
-        current_hunk = None
         old_line_start = 0
         new_line_start = 0
         old_lines = []
         new_lines = []
+        new_line_types = []
         is_binary = False
+
+        def _flush_hunk():
+            nonlocal hunks, current_file, old_line_start, new_line_start
+            nonlocal old_lines, new_lines, new_line_types, is_binary
+            if current_file and not is_binary and (old_lines or new_lines):
+                hunk = DiffHunk(
+                    file_path=current_file,
+                    old_line_start=old_line_start,
+                    new_line_start=new_line_start,
+                    old_lines=old_lines.copy(),
+                    new_lines=new_lines.copy(),
+                    new_line_types=new_line_types.copy(),
+                    old_line_end=old_line_start + len(old_lines) - 1 if old_lines else old_line_start,
+                    new_line_end=new_line_start + len(new_lines) - 1 if new_lines else new_line_start,
+                    is_binary=is_binary,
+                )
+                hunks.append(hunk)
+
         for line in output.split("\n"):
             if line.startswith("diff --git"):
-                if current_file and not is_binary:
-                    if old_lines or new_lines:
-                        hunks.append(DiffHunk(
-                            file_path=current_file,
-                            old_line_start=old_line_start,
-                            new_line_start=new_line_start,
-                            old_lines=old_lines.copy(),
-                            new_lines=new_lines.copy(),
-                        ))
+                _flush_hunk()
                 parts = line.split(" b/")
                 if len(parts) == 2:
                     current_file = parts[1]
                 old_lines = []
                 new_lines = []
+                new_line_types = []
                 is_binary = False
             elif line.startswith("Binary files"):
                 is_binary = True
             elif line.startswith("@@"):
-                if current_file and not is_binary and (old_lines or new_lines):
-                    hunks.append(DiffHunk(
-                        file_path=current_file,
-                        old_line_start=old_line_start,
-                        new_line_start=new_line_start,
-                        old_lines=old_lines.copy(),
-                        new_lines=new_lines.copy(),
-                    ))
+                _flush_hunk()
                 old_lines = []
                 new_lines = []
+                new_line_types = []
                 match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
                 if match:
                     old_line_start = int(match.group(1))
@@ -180,18 +188,12 @@ class HistoryWalker:
                 old_lines.append(line[1:])
             elif line.startswith("+"):
                 new_lines.append(line[1:])
+                new_line_types.append("added")
             elif line.startswith(" "):
                 old_lines.append(line[1:])
                 new_lines.append(line[1:])
-        if current_file and not is_binary and (old_lines or new_lines):
-            hunks.append(DiffHunk(
-                file_path=current_file,
-                old_line_start=old_line_start,
-                new_line_start=new_line_start,
-                old_lines=old_lines.copy(),
-                new_lines=new_lines.copy(),
-                is_binary=is_binary,
-            ))
+                new_line_types.append("context")
+        _flush_hunk()
         return hunks
 
     def get_all_commits(self) -> List[str]:
