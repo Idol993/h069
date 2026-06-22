@@ -194,6 +194,23 @@ class HistoryWalker:
             ))
         return hunks
 
+    def get_all_commits(self) -> List[str]:
+        output = self._run_git(["rev-list", "--all", "--reverse"])
+        commits = [line.strip() for line in output.strip().split("\n") if line.strip()]
+        if self.max_commits and len(commits) > self.max_commits:
+            commits = commits[:self.max_commits]
+        return commits
+
+    def get_commits_between(self, base_ref: str, head_ref: str) -> List[str]:
+        try:
+            output = self._run_git(["rev-list", "--reverse", f"{base_ref}..{head_ref}"])
+            commits = [line.strip() for line in output.strip().split("\n") if line.strip()]
+            if self.max_commits and len(commits) > self.max_commits:
+                commits = commits[:self.max_commits]
+            return commits
+        except Exception:
+            return []
+
     def walk_commits(self, since_commit: Optional[str] = None) -> Generator[DiffResult, None, None]:
         commits = self.get_all_commits()
         if since_commit:
@@ -202,6 +219,17 @@ class HistoryWalker:
                 commits = commits[idx:]
             except ValueError:
                 pass
+        for sha in commits:
+            try:
+                commit_info = self.get_commit_info(sha)
+                hunks = self.parse_diff_tree(sha, commit_info.parent_sha)
+                if hunks:
+                    yield DiffResult(commit=commit_info, hunks=hunks)
+            except Exception:
+                continue
+
+    def walk_commits_range(self, base_ref: str, head_ref: str) -> Generator[DiffResult, None, None]:
+        commits = self.get_commits_between(base_ref, head_ref)
         for sha in commits:
             try:
                 commit_info = self.get_commit_info(sha)

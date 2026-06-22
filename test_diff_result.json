@@ -1,0 +1,14 @@
+{
+  "scan_date": "2026-06-22T02:12:00.253584",
+  "summary": {
+    "total_active": 0,
+    "total_ignored": 0,
+    "total_resolved": 0,
+    "new": 0,
+    "existing": 0,
+    "resolved": 0,
+    "blocking": 0,
+    "by_severity": {}
+  },
+  "findings": []
+}

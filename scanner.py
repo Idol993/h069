@@ -243,6 +243,70 @@ class GitSecretScanner:
             findings = self.scan_commit(diff_result)
             for finding in findings:
                 reporter.add_finding(finding)
+                if self.baseline is not None and not finding.ignored:
+                    self.baseline.update_entry_seen(
+                        secret_value=finding.secret_value,
+                        file_path=finding.file_path,
+                        rule_id=finding.rule_id,
+                        commit_sha=finding.commit_sha,
+                        author=finding.author_name,
+                        date=finding.commit_date,
+                    )
+        if self.baseline is not None:
+            current_fps = set()
+            for finding in reporter.findings:
+                if not finding.ignored:
+                    fp = Baseline.compute_fingerprint(
+                        finding.secret_value, finding.file_path, finding.rule_id
+                    )
+                    current_fps.add(fp)
+            resolved_entries = self.baseline.get_resolved_entries()
+            if not resolved_entries:
+                self.baseline.mark_resolved(current_fps)
+                resolved_entries = self.baseline.get_resolved_entries()
+            for entry in resolved_entries:
+                reporter.add_resolved_from_baseline(entry)
+        elapsed = time.time() - start_time
+        return reporter
+
+    def scan_diff(
+        self,
+        base_ref: str,
+        head_ref: str,
+        reporter: Optional[Reporter] = None,
+        progress_callback=None,
+    ) -> Reporter:
+        if reporter is None:
+            reporter = Reporter(output_format="terminal")
+        total_commits = 0
+        start_time = time.time()
+        for diff_result in self.walker.walk_commits_range(base_ref, head_ref):
+            total_commits += 1
+            if progress_callback:
+                progress_callback(total_commits)
+            findings = self.scan_commit(diff_result)
+            for finding in findings:
+                reporter.add_finding(finding)
+                if self.baseline is not None and not finding.ignored:
+                    self.baseline.update_entry_seen(
+                        secret_value=finding.secret_value,
+                        file_path=finding.file_path,
+                        rule_id=finding.rule_id,
+                        commit_sha=finding.commit_sha,
+                        author=finding.author_name,
+                        date=finding.commit_date,
+                    )
+        if self.baseline is not None:
+            current_fps = set()
+            for finding in reporter.findings:
+                if not finding.ignored:
+                    fp = Baseline.compute_fingerprint(
+                        finding.secret_value, finding.file_path, finding.rule_id
+                    )
+                    current_fps.add(fp)
+            resolved_entries = self.baseline.get_resolved_entries()
+            for entry in resolved_entries:
+                reporter.add_resolved_from_baseline(entry)
         elapsed = time.time() - start_time
         return reporter
 
@@ -340,6 +404,89 @@ if click is not None:
             click.echo(f"Error: {e}", err=True)
             sys.exit(1)
 
+    @cli.command('diff')
+    @click.argument('base_ref')
+    @click.argument('head_ref')
+    @click.argument('repo_path', default='.')
+    @click.option('--rules', '-r', 'rules_path', type=click.Path(exists=True, dir_okay=False),
+                  help='Path to custom rules YAML file')
+    @click.option('--format', '-f', 'output_format', type=click.Choice(['terminal', 'json', 'sarif']),
+                  default='terminal', help='Output format')
+    @click.option('--output', '-o', 'output_file', type=click.Path(dir_okay=False, writable=True),
+                  help='Output file path')
+    @click.option('--entropy-threshold', type=float, default=4.5,
+                  help='Entropy threshold for high-entropy detection')
+    @click.option('--min-entropy-length', type=int, default=32,
+                  help='Minimum length for high-entropy string detection')
+    @click.option('--context-lines', type=int, default=5,
+                  help='Number of context lines to show before and after')
+    @click.option('--no-entropy', is_flag=True, default=False,
+                  help='Disable high-entropy string scanning')
+    @click.option('--baseline', '-b', 'baseline_path', type=click.Path(dir_okay=False),
+                  help='Path to baseline file for comparing results')
+    @click.option('--fail-on-severity', 'fail_on_severity', type=str, default=None,
+                  help='Comma-separated list of severities to fail on (e.g. critical,high). Single value acts as threshold (>= severity)')
+    @click.option('--fail-on-new-only', is_flag=True, default=False,
+                  help='Only fail on new findings (not existing in baseline)')
+    @click.option('--fail-on-tags', 'fail_on_tags', type=str, default=None,
+                  help='Comma-separated list of tags to fail on')
+    @click.option('--exit-code', is_flag=True, default=False,
+                  help='Exit with non-zero code if blocking secrets are found')
+    def scan_diff(
+        base_ref,
+        head_ref,
+        repo_path,
+        rules_path,
+        output_format,
+        output_file,
+        entropy_threshold,
+        min_entropy_length,
+        context_lines,
+        no_entropy,
+        baseline_path,
+        fail_on_severity,
+        fail_on_new_only,
+        fail_on_tags,
+        exit_code,
+    ):
+        try:
+            baseline = Baseline(baseline_path) if baseline_path else None
+            exit_policy = ExitPolicy()
+            if fail_on_severity:
+                exit_policy.fail_on_severity = [s.strip() for s in fail_on_severity.split(',')]
+            if fail_on_new_only:
+                exit_policy.fail_on_new_only = True
+            if fail_on_tags:
+                exit_policy.fail_on_tags = [t.strip() for t in fail_on_tags.split(',')]
+            scanner = GitSecretScanner(
+                repo_path=repo_path,
+                custom_rules_path=rules_path,
+                entropy_threshold=entropy_threshold,
+                min_entropy_length=min_entropy_length,
+                context_lines=context_lines,
+                enable_entropy_scan=not no_entropy,
+                baseline=baseline,
+            )
+            reporter = Reporter(
+                output_format=output_format,
+                output_file=output_file,
+                repo_path=str(scanner.repo_path),
+                exit_policy=exit_policy,
+            )
+            with click.progressbar(label=f'Scanning {base_ref}..{head_ref}', length=0) as bar:
+                def progress(count):
+                    bar.length = count
+                    bar.update(1)
+                reporter = scanner.scan_diff(base_ref, head_ref, reporter, progress_callback=progress)
+            reporter.render()
+            if exit_code and exit_policy.should_fail(reporter.findings):
+                sys.exit(1)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            click.echo(f"Error: {e}", err=True)
+            sys.exit(1)
+
     @cli.group()
     def baseline():
         pass
@@ -398,7 +545,9 @@ if click is not None:
                   help='Path to custom rules YAML file')
     @click.option('--no-entropy', is_flag=True, default=False,
                   help='Disable high-entropy string scanning')
-    def baseline_update(repo_path, baseline_path, rules_path, no_entropy):
+    @click.option('--keep-resolved/--clean-resolved', default=True,
+                  help='Keep resolved entries in baseline (for trend tracking) or clean them out')
+    def baseline_update(repo_path, baseline_path, rules_path, no_entropy, keep_resolved):
         try:
             baseline_obj = Baseline(baseline_path)
             scanner = GitSecretScanner(
@@ -432,14 +581,16 @@ if click is not None:
                         date=finding.commit_date,
                     )
                     added += 1
-            removed = 0
-            to_remove = [fp for fp in baseline_obj.entries if fp not in current_fps]
-            for fp in to_remove:
-                del baseline_obj.entries[fp]
-                removed += 1
+            if keep_resolved:
+                baseline_obj.mark_resolved(current_fps)
+                resolved_count = len(baseline_obj.get_resolved_entries())
+                removed = 0
+            else:
+                removed = baseline_obj.cleanup_resolved()
+                resolved_count = 0
             baseline_obj.save()
             click.echo(f"Baseline updated: {len(baseline_obj.entries)} entries "
-                       f"(added: {added}, removed: {removed})")
+                       f"(added: {added}, resolved: {resolved_count}, removed: {removed})")
         except Exception as e:
             import traceback
             traceback.print_exc()

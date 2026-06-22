@@ -17,7 +17,11 @@ class BaselineEntry:
     first_seen_commit: str
     first_seen_author: str
     first_seen_date: str
+    last_seen_commit: str = ""
+    last_seen_author: str = ""
+    last_seen_date: str = ""
     status: str = "existing"
+    resolved_at: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -80,8 +84,30 @@ class Baseline:
             first_seen_commit=commit_sha,
             first_seen_author=author,
             first_seen_date=date,
+            last_seen_commit=commit_sha,
+            last_seen_author=author,
+            last_seen_date=date,
         )
         self.entries[fingerprint] = entry
+        return entry
+
+    def update_entry_seen(
+        self,
+        secret_value: str,
+        file_path: str,
+        rule_id: str,
+        commit_sha: str,
+        author: str,
+        date: str,
+    ) -> Optional[BaselineEntry]:
+        fingerprint = self.compute_fingerprint(secret_value, file_path, rule_id)
+        entry = self.entries.get(fingerprint)
+        if entry:
+            entry.last_seen_commit = commit_sha
+            entry.last_seen_author = author
+            entry.last_seen_date = date
+            entry.status = "existing"
+            entry.resolved_at = ""
         return entry
 
     def contains(self, secret_value: str, file_path: str, rule_id: str) -> bool:
@@ -105,12 +131,36 @@ class Baseline:
         }
         for fp, entry in self.entries.items():
             if fp not in current_fingerprints:
-                entry.status = "resolved"
+                if entry.status != "resolved":
+                    entry.status = "resolved"
+                    entry.resolved_at = datetime.now().isoformat()
                 result["resolved"].append(entry)
             else:
                 entry.status = "existing"
+                entry.resolved_at = ""
                 result["existing"].append(entry)
         return result
+
+    def mark_resolved(self, current_fingerprints: Set[str]) -> List[BaselineEntry]:
+        resolved_entries = []
+        for fp, entry in self.entries.items():
+            if fp not in current_fingerprints and entry.status != "resolved":
+                entry.status = "resolved"
+                entry.resolved_at = datetime.now().isoformat()
+                resolved_entries.append(entry)
+        return resolved_entries
+
+    def get_resolved_entries(self) -> List[BaselineEntry]:
+        return [e for e in self.entries.values() if e.status == "resolved"]
+
+    def get_existing_entries(self) -> List[BaselineEntry]:
+        return [e for e in self.entries.values() if e.status == "existing"]
+
+    def cleanup_resolved(self) -> int:
+        to_remove = [fp for fp, e in self.entries.items() if e.status == "resolved"]
+        for fp in to_remove:
+            del self.entries[fp]
+        return len(to_remove)
 
     def update_from_findings(self, findings: list):
         from reporter import ScanFinding

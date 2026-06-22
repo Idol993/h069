@@ -61,28 +61,49 @@ class ExitPolicy:
     fail_on_tags: Optional[List[str]] = None
     fail_on_new_only: bool = False
 
-    def should_fail(self, findings: List[ScanFinding]) -> bool:
-        blocking_findings = [f for f in findings if not f.ignored]
-        if not blocking_findings:
+    SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+
+    def _get_effective_severities(self) -> Optional[Set[str]]:
+        if not self.fail_on_severity:
+            return None
+        if len(self.fail_on_severity) == 1:
+            sev = self.fail_on_severity[0].lower()
+            if sev in self.SEVERITY_ORDER:
+                idx = self.SEVERITY_ORDER.index(sev)
+                return set(self.SEVERITY_ORDER[:idx + 1])
+        return {s.lower() for s in self.fail_on_severity}
+
+    def is_threshold_mode(self) -> bool:
+        if not self.fail_on_severity or len(self.fail_on_severity) != 1:
             return False
+        return self.fail_on_severity[0].lower() in self.SEVERITY_ORDER
+
+    def get_description(self) -> str:
+        parts = []
         if self.fail_on_severity:
-            severities = {s.lower() for s in self.fail_on_severity}
-            blocking_findings = [f for f in blocking_findings if f.severity.lower() in severities]
-        if self.fail_on_status:
-            statuses = {s.lower() for s in self.fail_on_status}
-            blocking_findings = [f for f in blocking_findings if f.status.lower() in statuses]
-        if self.fail_on_tags:
-            tags = {t.lower() for t in self.fail_on_tags}
-            blocking_findings = [f for f in blocking_findings if any(t.lower() in tags for t in f.tags)]
+            if self.is_threshold_mode():
+                sev = self.fail_on_severity[0].lower()
+                parts.append(f"severity >= {sev}")
+            else:
+                parts.append(f"severity in [{','.join(self.fail_on_severity)}]")
         if self.fail_on_new_only:
-            blocking_findings = [f for f in blocking_findings if f.status.lower() == "new"]
-        return len(blocking_findings) > 0
+            parts.append("new findings only")
+        if self.fail_on_tags:
+            parts.append(f"tags: {','.join(self.fail_on_tags)}")
+        if self.fail_on_status:
+            parts.append(f"status: {','.join(self.fail_on_status)}")
+        return ", ".join(parts) if parts else "all active findings"
+
+    def should_fail(self, findings: List[ScanFinding]) -> bool:
+        return len(self.get_blocking_findings(findings)) > 0
 
     def get_blocking_findings(self, findings: List[ScanFinding]) -> List[ScanFinding]:
         blocking = [f for f in findings if not f.ignored]
-        if self.fail_on_severity:
-            severities = {s.lower() for s in self.fail_on_severity}
-            blocking = [f for f in blocking if f.severity.lower() in severities]
+        if not blocking:
+            return []
+        effective_severities = self._get_effective_severities()
+        if effective_severities is not None:
+            blocking = [f for f in blocking if f.severity.lower() in effective_severities]
         if self.fail_on_status:
             statuses = {s.lower() for s in self.fail_on_status}
             blocking = [f for f in blocking if f.status.lower() in statuses]
@@ -110,12 +131,66 @@ class Reporter:
         self.resolved_findings: List[ScanFinding] = []
         self.exit_policy = exit_policy or ExitPolicy()
         self._console = Console() if RICH_AVAILABLE else None
+        self._known_secrets: Set[str] = set()
+        self._sorted_secrets: Optional[List[str]] = None
+
+    def _collect_known_secrets(self):
+        if self._sorted_secrets is not None:
+            return
+        for f in self.findings + self.ignored_findings:
+            if f.secret_value and len(f.secret_value) >= 4:
+                self._known_secrets.add(f.secret_value)
+        self._sorted_secrets = sorted(self._known_secrets, key=len, reverse=True)
+
+    def mask_line_full(self, line: str) -> str:
+        if not line:
+            return line
+        self._collect_known_secrets()
+        result = line
+        for secret in self._sorted_secrets:
+            if len(secret) < 4:
+                continue
+            masked = self.mask_secret(secret)
+            result = result.replace(secret, masked)
+        return result
 
     def add_finding(self, finding: ScanFinding):
+        self._sorted_secrets = None
         if finding.ignored:
             self.ignored_findings.append(finding)
+        elif finding.status == "resolved":
+            self.resolved_findings.append(finding)
         else:
             self.findings.append(finding)
+
+    def add_resolved_from_baseline(self, baseline_entry):
+        finding = ScanFinding(
+            rule_id=baseline_entry.rule_id,
+            rule_description=baseline_entry.rule_id,
+            severity="medium",
+            secret_value="",
+            masked_value=baseline_entry.secret_value_masked,
+            file_path=baseline_entry.file_path,
+            line_number=baseline_entry.line_number,
+            commit_sha=baseline_entry.last_seen_commit or baseline_entry.first_seen_commit,
+            short_sha=(baseline_entry.last_seen_commit or baseline_entry.first_seen_commit)[:7],
+            commit_number=0,
+            author_name=baseline_entry.last_seen_author or baseline_entry.first_seen_author,
+            author_email="",
+            commit_date=baseline_entry.last_seen_date or baseline_entry.first_seen_date,
+            commit_message="",
+            context_before=[],
+            context_after=[],
+            line_content="",
+            start_offset=0,
+            end_offset=0,
+            entropy=None,
+            tags=[],
+            status="resolved",
+            ignored=False,
+            ignore_reason="",
+        )
+        self.resolved_findings.append(finding)
 
     def mask_secret(self, secret: str, show_first: int = 2, show_last: int = 2) -> str:
         if len(secret) <= show_first + show_last:
@@ -129,13 +204,16 @@ class Reporter:
         return line[:start] + masked_part + line[end:]
 
     def get_masked_context_before(self, finding: ScanFinding) -> List[str]:
-        return finding.context_before
+        return [self.mask_line_full(line) for line in finding.context_before]
 
     def get_masked_line_content(self, finding: ScanFinding) -> str:
-        return self.mask_line(finding.line_content, finding.start_offset, finding.end_offset)
+        if not finding.line_content:
+            return ""
+        line = self.mask_line(finding.line_content, finding.start_offset, finding.end_offset)
+        return self.mask_line_full(line)
 
     def get_masked_context_after(self, finding: ScanFinding) -> List[str]:
-        return finding.context_after
+        return [self.mask_line_full(line) for line in finding.context_after]
 
     def generate_vscode_link(self, file_path: str, line_number: int) -> str:
         if self.repo_path:
@@ -220,12 +298,14 @@ class Reporter:
             if finding.revert_suggestion:
                 info_table.add_row("Revert", f"[yellow]{finding.revert_suggestion.revert_command}[/yellow]")
             masked_line = self.get_masked_line_content(finding)
+            masked_before = self.get_masked_context_before(finding)
+            masked_after = self.get_masked_context_after(finding)
             context_lines = []
-            ctx_start = finding.line_number - len(finding.context_before)
-            for j, line in enumerate(finding.context_before):
+            ctx_start = finding.line_number - len(masked_before)
+            for j, line in enumerate(masked_before):
                 context_lines.append((ctx_start + j, line, "dim"))
             context_lines.append((finding.line_number, masked_line, color))
-            for j, line in enumerate(finding.context_after):
+            for j, line in enumerate(masked_after):
                 context_lines.append((finding.line_number + j + 1, line, "dim"))
             code_content = "\n".join(
                 f"{ln:4d} | {line}" for ln, line, _ in context_lines
@@ -253,6 +333,17 @@ class Reporter:
                 reason = f.ignore_reason or "allowlist"
                 ignored_table.add_row(f.rule_id, f"{f.file_path}:{f.line_number}", reason)
             console.print(Panel(ignored_table, title=ignored_title, border_style="cyan"))
+        if self.resolved_findings:
+            console.print()
+            resolved_title = Text(f"Resolved Findings ({len(self.resolved_findings)})", style="bold green")
+            resolved_table = Table(title="", show_header=False, border_style="dim")
+            resolved_table.add_column("Rule", style="dim")
+            resolved_table.add_column("File", style="dim")
+            resolved_table.add_column("Last Seen", style="dim")
+            for f in self.resolved_findings:
+                last_seen = f.commit_date or "unknown"
+                resolved_table.add_row(f.rule_id, f"{f.file_path}:{f.line_number}", last_seen)
+            console.print(Panel(resolved_table, title=resolved_title, border_style="green"))
         summary_table = Table(title="Summary", show_header=True, border_style="dim")
         summary_table.add_column("Category", style="bold")
         summary_table.add_column("Critical", justify="right")
@@ -271,6 +362,7 @@ class Reporter:
         new_counts = count_by_severity([f for f in self.findings if f.status == "new"])
         existing_counts = count_by_severity([f for f in self.findings if f.status == "existing"])
         ignored_counts = count_by_severity(self.ignored_findings)
+        resolved_counts = count_by_severity(self.resolved_findings)
         total_active = count_by_severity(self.findings)
         summary_table.add_row(
             Text("New", style="bright_green"),
@@ -297,6 +389,14 @@ class Reporter:
             str(ignored_counts["total"]),
         )
         summary_table.add_row(
+            Text("Resolved", style="green"),
+            str(resolved_counts["critical"]),
+            str(resolved_counts["high"]),
+            str(resolved_counts["medium"]),
+            str(resolved_counts["low"]),
+            str(resolved_counts["total"]),
+        )
+        summary_table.add_row(
             Text("TOTAL (active)", style="bold"),
             Text(str(total_active["critical"]), style="bold"),
             Text(str(total_active["high"]), style="bold"),
@@ -308,16 +408,10 @@ class Reporter:
         blocking = self.exit_policy.get_blocking_findings(self.findings)
         if blocking:
             console.print()
-            fail_reasons = []
-            if self.exit_policy.fail_on_severity:
-                fail_reasons.append(f"severity >= {','.join(self.exit_policy.fail_on_severity)}")
-            if self.exit_policy.fail_on_new_only:
-                fail_reasons.append("new findings only")
-            if self.exit_policy.fail_on_tags:
-                fail_reasons.append(f"tags: {','.join(self.exit_policy.fail_on_tags)}")
-            reason_text = ", ".join(fail_reasons) if fail_reasons else "all active findings"
+            reason_text = self.exit_policy.get_description()
             console.print(Panel(
-                Text(f"FAIL - {len(blocking)} blocking finding(s) ({reason_text})", style="bold red"),
+                Text(f"FAIL - {len(blocking)} blocking finding(s)", style="bold red"),
+                subtitle=Text(f"Rule: {reason_text}", style="dim"),
                 border_style="red",
             ))
 
@@ -345,30 +439,39 @@ class Reporter:
             if finding.revert_suggestion:
                 print(f"  Revert: {finding.revert_suggestion.revert_command}")
             print("  Context:")
-            ctx_start = finding.line_number - len(finding.context_before)
-            for j, line in enumerate(finding.context_before):
+            masked_before = self.get_masked_context_before(finding)
+            masked_after = self.get_masked_context_after(finding)
+            ctx_start = finding.line_number - len(masked_before)
+            for j, line in enumerate(masked_before):
                 print(f"    {ctx_start + j:4d}: {line}")
             masked_line = self.get_masked_line_content(finding)
             print(f"    {finding.line_number:4d}: {masked_line}")
-            for j, line in enumerate(finding.context_after):
+            for j, line in enumerate(masked_after):
                 print(f"    {finding.line_number + j + 1:4d}: {line}")
         if self.ignored_findings:
             print(f"\nIgnored findings: {len(self.ignored_findings)}")
             for f in self.ignored_findings:
                 reason = f.ignore_reason or "allowlist"
                 print(f"  - {f.rule_id}: {f.file_path}:{f.line_number} ({reason})")
+        if self.resolved_findings:
+            print(f"\nResolved findings: {len(self.resolved_findings)}")
+            for f in self.resolved_findings:
+                last_seen = f.commit_date or "unknown"
+                print(f"  - {f.rule_id}: {f.file_path}:{f.line_number} (last seen: {last_seen})")
         new_count = sum(1 for f in self.findings if f.status == "new")
         existing_count = sum(1 for f in self.findings if f.status == "existing")
-        print(f"\nSummary: {len(self.findings)} active (new: {new_count}, existing: {existing_count}), {len(self.ignored_findings)} ignored")
+        print(f"\nSummary: {len(self.findings)} active (new: {new_count}, existing: {existing_count}), {len(self.ignored_findings)} ignored, {len(self.resolved_findings)} resolved")
         blocking = self.exit_policy.get_blocking_findings(self.findings)
         if blocking:
             print(f"Blocking findings: {len(blocking)} (would fail CI)")
 
     def render_json(self) -> str:
         findings_data = []
-        all_findings = self.findings + self.ignored_findings
+        all_findings = self.findings + self.ignored_findings + self.resolved_findings
         for finding in all_findings:
-            masked_line = self.get_masked_line_content(finding)
+            masked_line = self.get_masked_line_content(finding) if finding.line_content else ""
+            masked_before = self.get_masked_context_before(finding)
+            masked_after = self.get_masked_context_after(finding)
             data = {
                 "rule_id": finding.rule_id,
                 "rule_description": finding.rule_description,
@@ -387,8 +490,8 @@ class Reporter:
                 "commit_date": finding.commit_date,
                 "commit_message": finding.commit_message,
                 "line_content_masked": masked_line,
-                "context_before": finding.context_before,
-                "context_after": finding.context_after,
+                "context_before_masked": masked_before,
+                "context_after_masked": masked_after,
                 "start_offset": finding.start_offset,
                 "end_offset": finding.end_offset,
                 "entropy": finding.entropy,
@@ -401,8 +504,10 @@ class Reporter:
         summary = {
             "total_active": len(self.findings),
             "total_ignored": len(self.ignored_findings),
+            "total_resolved": len(self.resolved_findings),
             "new": sum(1 for f in self.findings if f.status == "new"),
             "existing": sum(1 for f in self.findings if f.status == "existing"),
+            "resolved": len(self.resolved_findings),
             "blocking": len(blocking),
             "by_severity": {},
         }
@@ -438,7 +543,7 @@ class Reporter:
 
     def _get_sarif_rules(self) -> List[Dict[str, Any]]:
         rules_seen = {}
-        all_findings = self.findings + self.ignored_findings
+        all_findings = self.findings + self.ignored_findings + self.resolved_findings
         for finding in all_findings:
             if finding.rule_id not in rules_seen:
                 rules_seen[finding.rule_id] = {
@@ -461,24 +566,33 @@ class Reporter:
 
     def _get_sarif_results(self) -> List[Dict[str, Any]]:
         results = []
-        all_findings = self.findings + self.ignored_findings
+        all_findings = self.findings + self.ignored_findings + self.resolved_findings
         for finding in all_findings:
-            masked_line = self.get_masked_line_content(finding)
+            masked_line = self.get_masked_line_content(finding) if finding.line_content else ""
             if finding.status == "new":
                 kind = "fail"
             elif finding.status == "existing":
                 kind = "pass"
+            elif finding.status == "resolved":
+                kind = "notApplicable"
             else:
                 kind = "open"
             level = self._get_severity_sarif_level(finding.severity)
             if finding.ignored:
                 level = "note"
                 kind = "notApplicable"
+            if finding.status == "resolved":
+                level = "note"
             suppressions = []
             if finding.ignored:
                 suppressions.append({
                     "kind": "inSource",
                     "justification": finding.ignore_reason or "allowlist",
+                })
+            if finding.status == "resolved":
+                suppressions.append({
+                    "kind": "external",
+                    "justification": "resolved - secret no longer present in codebase",
                 })
             result = {
                 "ruleId": finding.rule_id,
@@ -488,7 +602,7 @@ class Reporter:
                     "text": f"[{finding.status.upper()}] {finding.rule_description} in {finding.file_path}:{finding.line_number}. "
                             f"Secret: {finding.masked_value}. "
                             f"Commit: {finding.short_sha} by {finding.author_name}."
-                            f" Line: {masked_line}"
+                            + (f" Line: {masked_line}" if masked_line else "")
                 },
                 "locations": [
                     {
@@ -500,17 +614,13 @@ class Reporter:
                                 "startLine": finding.line_number,
                                 "startColumn": finding.start_offset + 1,
                                 "endColumn": finding.end_offset + 1,
-                                "snippet": {
-                                    "text": masked_line,
-                                },
                             },
                         }
                     }
                 ],
                 "partialFingerprints": {
                     "commitSha": finding.commit_sha,
-                    "secretHash": str(hash(finding.secret_value)),
-                    "primaryLocationLineHash": str(hash(f"{finding.file_path}:{finding.line_number}:{finding.secret_value[:10]}")),
+                    "primaryLocationLineHash": str(hash(f"{finding.file_path}:{finding.line_number}:{finding.masked_value[:10]}")),
                 },
                 "properties": {
                     "status": finding.status,
@@ -525,6 +635,10 @@ class Reporter:
                     "tags": finding.tags,
                 },
             }
+            if finding.line_content:
+                result["locations"][0]["physicalLocation"]["region"]["snippet"] = {
+                    "text": masked_line,
+                }
             if suppressions:
                 result["suppressions"] = suppressions
             if finding.revert_suggestion:
